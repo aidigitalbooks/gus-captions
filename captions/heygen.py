@@ -79,9 +79,29 @@ def fetch(video_id, out):
         print("downloaded video + captions")
     else:
         print("downloaded video (no caption file from HeyGen)")
+    title = d.get("video_title") or d.get("title") or lookup_title(video_id)
     with open(os.path.join(out, "meta.json"), "w") as f:
-        json.dump({"video_id": video_id, "title": d.get("video_title") or d.get("title") or "",
+        # "untitled" never matches the Gus prefix, so the relay skips videos it can't identify
+        json.dump({"video_id": video_id, "title": title or "untitled",
                    "duration": d.get("duration")}, f)
+
+
+def lookup_title(video_id):
+    """video_status.get doesn't always include the title; find it in the video list."""
+    token = None
+    for _ in range(10):  # up to ~10 pages of recent videos
+        path = "/v1/video.list" + (f"?token={token}" if token else "")
+        try:
+            data = call(path).get("data") or {}
+        except Exception:
+            return ""
+        for v in data.get("videos") or data.get("list") or []:
+            if (v.get("video_id") or v.get("id")) == video_id:
+                return v.get("video_title") or v.get("title") or ""
+        token = data.get("token")
+        if not token:
+            break
+    return ""
 
 
 def main():
