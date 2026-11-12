@@ -1,0 +1,120 @@
+name: Caption Gus videos
+
+# Runs three ways:
+#  1. Instantly: the Cloudflare relay starts it when HeyGen finishes a video (repository_dispatch)
+#  2. By hand: Actions tab -> "Caption Gus videos" -> Run workflow (optionally paste a video ID)
+#  3. Once a day as a safety net: catches any Gus video the relay missed
+on:
+  schedule:
+    - cron: "17 13 * * *"
+  workflow_dispatch:
+    inputs:
+      video_id:
+        description: "HeyGen video ID (leave empty to process all new Gus videos)"
+        required: false
+        default: ""
+      video_url:
+        description: "OR: direct MP4 link (no HeyGen API key needed)"
+        required: false
+        default: ""
+      srt_url:
+        description: "Caption file (.srt) link to go with video_url"
+        required: false
+        default: ""
+      name:
+        description: "Short name for this video (used with video_url)"
+        required: false
+        default: "gus-video"
+  repository_dispatch:
+    types: [heygen_video]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: caption-gus
+  cancel-in-progress: false
+
+jobs:
+  caption:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HEYGEN_API_KEY: ${{ secrets.HEYGEN_API_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      TITLE_PREFIX: ${{ vars.TITLE_PREFIX || 'Gus' }}
+      CAPTION_Y: ${{ vars.CAPTION_Y || '0.44' }}
+      NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg + Pillow
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          pip install --quiet pillow
+
+      - name: Caption from direct links (no HeyGen API)
+        if: github.event.inputs.video_url != ''
+        run: |
+          NAME=$(echo "${{ github.event.inputs.name }}" | tr -c 'A-Za-z0-9-' '-' | sed 's/-*$//')
+          TAG="link-$NAME-$(date +%Y%m%d%H%M)"
+          mkdir -p work
+          curl -sSL -o work/video.mp4 "${{ github.event.inputs.video_url }}"
+          curl -sSL -o work/captions.srt "${{ github.event.inputs.srt_url }}"
+          OUT="$NAME.mp4"
+          python captions/burn.py --video work/video.mp4 --srt work/captions.srt --out "$OUT" --y "$CAPTION_Y"
+          gh release create "$TAG" "$OUT" --title "$NAME" --notes "Captioned from direct link"
+          URL="https://github.com/${{ github.repository }}/releases/download/$TAG/$OUT"
+          echo "Captioned video: $URL"
+          echo "- [$NAME]($URL)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Work out which videos to caption
+        if: github.event.inputs.video_url == ''
+        id: ids
+        run: |
+          ID="${{ github.event.inputs.video_id }}"
+          if [ -z "$ID" ]; then ID="${{ github.event.client_payload.video_id }}"; fi
+          if [ -n "$ID" ]; then
+            echo "$ID" > ids.txt
+          else
+            python captions/heygen.py list-new --prefix "$TITLE_PREFIX" --hours 48 > ids.txt
+          fi
+          echo "Candidates:"; cat ids.txt || true
+
+      - name: Caption and publish
+        if: github.event.inputs.video_url == ''
+        run: |
+          REPO="${{ github.repository }}"
+          while read -r ID; do
+            [ -z "$ID" ] && continue
+            TAG="video-$ID"
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "Already done: $ID"; continue
+            fi
+            echo "=== Captioning $ID"
+            rm -rf work && mkdir work
+            python captions/heygen.py fetch "$ID" --out work
+            if [ ! -f work/captions.srt ]; then
+              echo "::warning::No caption file from HeyGen for $ID - skipped. Create the video with captions enabled."
+              continue
+            fi
+            TITLE=$(python -c "import json;print(json.load(open('work/meta.json')).get('title') or '')")
+            if [ "${{ github.event_name }}" = "repository_dispatch" ] && [ -n "$TITLE" ]; then
+              case "$(echo "$TITLE" | tr '[:upper:]' '[:lower:]')" in
+                "$(echo "$TITLE_PREFIX" | tr '[:upper:]' '[:lower:]')"*) ;;
+                *) echo "Not a $TITLE_PREFIX video ('$TITLE') - skipped."; continue ;;
+              esac
+            fi
+            OUT="gus-$ID.mp4"
+            python captions/burn.py --video work/video.mp4 --srt work/captions.srt --out "$OUT" --y "$CAPTION_Y"
+            [ -z "$TITLE" ] && TITLE="$ID"
+            gh release create "$TAG" "$OUT" --title "$TITLE" --notes "Captioned from HeyGen video $ID"
+            URL="https://github.com/$REPO/releases/download/$TAG/$OUT"
+            echo "Captioned video: $URL"
+            echo "- [$TITLE]($URL)" >> "$GITHUB_STEP_SUMMARY"
+            if [ -n "$NOTIFY_WEBHOOK" ]; then
+              ID="$ID" TITLE="$TITLE" URL="$URL" python -c "import json,os,urllib.request as u; d=json.dumps({k.lower():os.environ[k] for k in ('ID','TITLE','URL')}).encode(); u.urlopen(u.Request(os.environ['NOTIFY_WEBHOOK'],data=d,headers={'Content-Type':'application/json'}),timeout=30)" \
+                || echo "::warning::notify webhook failed"
+            fi
+          done < ids.txt
